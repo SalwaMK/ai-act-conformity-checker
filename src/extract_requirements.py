@@ -1,4 +1,4 @@
-"""LLM-assisted requirement extraction script enforcing the 'leaf-only' rule.
+"""LLM-assisted requirement extraction script using the Groq API (or offline fallback).
 
 Decomposes bundled legal provisions from data/provisions.json into atomic,
 individually-checkable single-claim requirements, outputting to data/requirements_draft.json.
@@ -11,9 +11,25 @@ is_leaf: False.
 """
 
 import json
+import os
+import time
+import argparse
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from dotenv import load_dotenv
 from euaiact import AIAct
+
+# Automatically load GROQ_API_KEY from .env file
+load_dotenv()
+
+try:
+    from groq import Groq, RateLimitError
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    RateLimitError = Exception
+
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # LLM Prompt Template for extracting atomic requirements
 EXTRACTION_PROMPT_TEMPLATE = """
@@ -30,13 +46,15 @@ Provision Text:
 {full_text}
 
 Output JSON format:
-[
-  "Atomic requirement 1...",
-  "Atomic requirement 2..."
-]
+{{
+  "requirements": [
+    "Atomic requirement 1...",
+    "Atomic requirement 2..."
+  ]
+}}
 """
 
-# Pre-computed LLM-extracted atomic requirement map for leaf provisions
+# Pre-computed verified LLM requirement map for offline fallback
 LLM_LEAF_REQUIREMENTS_MAP = {
     # Article 9 Leaves
     "art_9.par_1": [
@@ -185,8 +203,50 @@ LLM_LEAF_REQUIREMENTS_MAP = {
 }
 
 
+def extract_atomic_requirements_via_groq(
+    client: Any,
+    citation: str,
+    full_text: str,
+    model: str = DEFAULT_GROQ_MODEL,
+    max_retries: int = 3,
+) -> List[str]:
+    """Call Groq API to extract atomic requirements for a provision with retry backoff."""
+    prompt = EXTRACTION_PROMPT_TEMPLATE.format(citation=citation, full_text=full_text)
+    
+    for attempt in range(max_retries):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an EU AI Act legal compliance expert. Output strictly JSON matching the required schema.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+
+            res_text = completion.choices[0].message.content
+            data = json.loads(res_text)
+
+            if isinstance(data, dict) and "requirements" in data and isinstance(data["requirements"], list):
+                return data["requirements"]
+            elif isinstance(data, list):
+                return data
+            return [full_text]
+        except RateLimitError as e:
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise e
+
+
 def process_provisions_file(
-    input_path: Path, output_path: Path, api_key: Optional[str] = None
+    input_path: Path,
+    output_path: Path,
+    use_groq: bool = False,
+    model: str = DEFAULT_GROQ_MODEL,
 ) -> tuple[list[dict], int, int]:
     """Read input provisions JSON and extract atomic requirements for leaf nodes only."""
     with open(input_path, "r", encoding="utf-8") as f:
@@ -194,6 +254,15 @@ def process_provisions_file(
 
     # Load euaiact to determine provision tree hierarchy and leaf nodes
     act = AIAct.load()
+
+    groq_client = None
+    if use_groq:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY is not set in environment or .env file.")
+        if not GROQ_AVAILABLE:
+            raise ImportError("groq package is not installed.")
+        groq_client = Groq(api_key=api_key)
 
     extracted_drafts = []
     total_atomic_count = 0
@@ -206,12 +275,16 @@ def process_provisions_file(
 
         if is_leaf:
             leaf_count += 1
-            atomic_reqs = LLM_LEAF_REQUIREMENTS_MAP.get(
-                pid,
-                [f"{item['citation']} obligation: {item['full_text'].strip()}"],
-            )
+            if groq_client:
+                atomic_reqs = extract_atomic_requirements_via_groq(
+                    groq_client, item["citation"], item["full_text"], model=model
+                )
+            else:
+                atomic_reqs = LLM_LEAF_REQUIREMENTS_MAP.get(
+                    pid,
+                    [f"{item['citation']} obligation: {item['full_text'].strip()}"],
+                )
         else:
-            # Parent nodes have children; keep heading/citation/text but clear requirements list for checking
             atomic_reqs = []
 
         entry = {
@@ -231,49 +304,27 @@ def process_provisions_file(
     return extracted_drafts, total_atomic_count, leaf_count
 
 
-def print_summary(
-    extracted_drafts: list[dict],
-    total_atomic_count: int,
-    leaf_count: int,
-    output_path: Path,
-) -> None:
-    """Print summary of leaf-only atomic requirement extraction."""
-    parent_count = len(extracted_drafts) - leaf_count
-
-    print("=" * 70)
-    print("LLM-Assisted Atomic Requirements Extraction (Leaf-Only Rule)")
-    print("=" * 70)
-    print(f"Total Provisions in Hierarchy: {len(extracted_drafts)}")
-    print(f"  • Leaf Provisions (Active checking targets): {leaf_count}")
-    print(f"  • Parent Provisions (Header/grouping only): {parent_count}")
-    print(f"Total Active Atomic Requirements: {total_atomic_count}")
-    print(f"Draft File Generated: {output_path}\n")
-
-    print("Sample Output Entries:")
-    print("-" * 70)
-
-    # Show a parent entry sample and a leaf entry sample
-    sample_ids = ["art_9.par_2", "art_9.par_2.pt_a"]
-    for entry in extracted_drafts:
-        if entry["id"] in sample_ids:
-            status = "LEAF (Checked)" if entry["is_leaf"] else "PARENT (Grouping only)"
-            print(f"[{entry['citation']} ({entry['id']}) - {status}]")
-            print(f"Requirements Count: {len(entry['requirements'])}")
-            for req in entry["requirements"]:
-                print(f"  • {req}")
-            print()
-
-    print("=" * 70)
-
-
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Extract atomic requirements from EU AI Act provisions.")
+    parser.add_argument("--use-groq", action="store_true", help="Force use of Groq API (reads GROQ_API_KEY from .env)")
+    parser.add_argument("--model", type=str, default=DEFAULT_GROQ_MODEL, help="Groq model name")
+    args = parser.parse_args()
+
     input_file = Path("data/provisions.json")
     output_file = Path("data/requirements_draft.json")
 
     extracted_drafts, total_count, leaf_count = process_provisions_file(
-        input_file, output_file
+        input_file, output_file, use_groq=args.use_groq, model=args.model
     )
-    print_summary(extracted_drafts, total_count, leaf_count, output_file)
+
+    parent_count = len(extracted_drafts) - leaf_count
+    print("=" * 70)
+    print(f"LLM Requirement Extraction Summary ({'Groq API' if args.use_groq else 'Verified Offline Draft'})")
+    print("=" * 70)
+    print(f"Total Provisions: {len(extracted_drafts)} (Leafs: {leaf_count}, Parents: {parent_count})")
+    print(f"Total Atomic Requirements Extracted: {total_count}")
+    print(f"Draft File Saved: {output_file}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
