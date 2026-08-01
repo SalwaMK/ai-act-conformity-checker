@@ -20,6 +20,7 @@ The project can run entirely offline using verified, deterministic sample evalua
 
 ```text
 .
+├── app.py                            # Streamlit browser UI for live checks
 ├── src/
 │   ├── fetch_provisions.py          # Extract selected EU AI Act provisions
 │   ├── extract_requirements.py      # Create atomic leaf-level requirements
@@ -45,6 +46,15 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 ```
+
+For the browser app, install the optional UI dependency and launch Streamlit:
+
+```bash
+pip install -e '.[app]'
+streamlit run app.py
+```
+
+Paste documentation into the app, choose Articles 9, 13, or 14 and individual sample requirements in the sidebar, then review the live verdict table and rendered HTML report. The default local matcher works without an API key; set `GROQ_API_KEY` to enable optional Groq evaluation.
 
 Run the bundled offline audit against all three sample documents:
 
@@ -135,10 +145,6 @@ Evidence-backed verdicts (JSON)
         ↓
 Human-readable HTML conformity report
 ```
-
-## License
-
-No license has been specified for this repository.
 
 ## Acknowledgements
 
